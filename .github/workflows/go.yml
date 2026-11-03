@@ -1,19 +1,34 @@
 name: Go
 
 on:
-  push:
-    branches: [ master ]
-  pull_request:
-    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Optional go test -run regexp; empty runs the full suite'
+        required: false
+        default: ''
 
 permissions: read-all
 
 jobs:
   build:
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
         go-version: [1.21.x, 1.22.x, 1.23.x]
         os: [ubuntu-latest, macos-latest, windows-latest]
+        # Go 1.21/1.22 test binaries abort on current macos-latest (dyld: missing LC_UUID); run those legs on macos-14.
+        exclude:
+          - go-version: 1.21.x
+            os: macos-latest
+          - go-version: 1.22.x
+            os: macos-latest
+        include:
+          - go-version: 1.21.x
+            os: macos-14
+          - go-version: 1.22.x
+            os: macos-14
     env:
       CGO_ENABLED: 0
     runs-on: ${{ matrix.os }}
@@ -30,22 +45,44 @@ jobs:
       run: go vet ./...
 
     - name: Test
-      run: go test ./...
+      run: go test ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test Noasm
-      run: go test -tags=noasm ./...
+      run: go test -tags=noasm ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./...
 
     - name: Test Race 1 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=1 -short -race -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=1 -short -race -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race1.log"
 
     - name: Test Race 4 CPU
       env:
         CGO_ENABLED: 1
-      run: go test -cpu=4 -short -race -v ./...
+      shell: bash
+      run: |
+        set -o pipefail
+        go test -cpu=4 -short -race -v ${{ inputs.test-filter && '-run' || '' }} ${{ inputs.test-filter }} ./... 2>&1 | tee "$RUNNER_TEMP/race4.log"
+
+    - name: Test summary and skipped tests
+      shell: bash
+      run: |
+        for r in race1 race4; do
+          f="$RUNNER_TEMP/$r.log"
+          echo "Go test summary ($r, -short -race -v) - passed: $(grep -cE '^ *--- PASS' "$f"), failed: $(grep -cE '^ *--- FAIL' "$f"), skipped: $(grep -cE '^ *--- SKIP' "$f")"
+        done
+        echo "Skipped tests (race1 run) with the skip message each test logged; tests with no message are gated in source on testing.Short() or the race detector, and run in the non-short Test/Test Noasm steps above:"
+        awk '/^=== (RUN|NAME|CONT|PAUSE) /{cur=$3; next} /^ *--- SKIP: /{n=$3; r=(n in msg)?msg[n]:"no message (testing.Short()/race-detector gate in source)"; print "SKIPPED: " n " -- reason: " r; next} /^ +[A-Za-z0-9_]+\.go:[0-9]+:/{if(cur!=""){m=$0; sub(/^ +/,"",m); msg[cur]=m}}' "$RUNNER_TEMP/race1.log"
+        for r in race1 race4; do
+          f="$RUNNER_TEMP/$r.log"
+          echo "Go test summary ($r, -short -race -v) - passed: $(grep -cE '^ *--- PASS' "$f"), failed: $(grep -cE '^ *--- FAIL' "$f"), skipped: $(grep -cE '^ *--- SKIP' "$f")"
+        done
 
   generate:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 30
     strategy:
       matrix:
         pkg: [s2, zstd, huff0]
@@ -69,6 +106,8 @@ jobs:
         test -z "$(git status --porcelain)"
 
   build-special:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -109,6 +148,8 @@ jobs:
       run: go test . -test.run=None;if [ $? -eq 0 ]; then go test ./s2/...; else true; fi
 
   fuzz-s2:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -140,6 +181,8 @@ jobs:
         run: go test -tags=noasm -run=none -fuzz=FuzzLZ4Block -fuzztime=500000x -test.fuzzminimizetime=10ms ./s2/.
 
   fuzz-zstd:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -180,6 +223,8 @@ jobs:
         run: cd zstd&&go test -run=none -fuzz=FuzzEncoding -fuzztime=25000x -test.fuzzminimizetime=10ms -fuzz-start=4&&cd ..
 
   fuzz-other:
+    if: ${{ inputs.test-filter == '' }}
+    timeout-minutes: 45
     env:
       CGO_ENABLED: 0
     runs-on: ubuntu-latest
@@ -206,3 +251,57 @@ jobs:
 
       - name: fse/FuzzDecompress
         run: go test -run=none -fuzz=FuzzDecompress -fuzztime=1000000x -test.fuzzminimizetime=10ms ./fse/.
+
+  module-zip:
+    timeout-minutes: 20
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Go
+        uses: actions/setup-go@v5.0.2
+        with:
+          go-version: 1.23.x
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build module zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/zipsrc /tmp/helper /tmp/modzip && mkdir -p /tmp/zipsrc /tmp/helper /tmp/modzip
+          tar -c --exclude=./.git -C "$GITHUB_WORKSPACE" . | tar -x -C /tmp/zipsrc
+          test ! -e /tmp/zipsrc/.git && test -f /tmp/zipsrc/go.mod
+          cd /tmp/helper
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'GOEOF'
+          package main
+
+          import (
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              f, err := os.Create(os.Args[4])
+              if err != nil {
+                  panic(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: os.Args[1], Version: os.Args[2]}, os.Args[3]); err != nil {
+                  panic(err)
+              }
+          }
+          GOEOF
+          go run . github.com/klauspost/compress v1.17.11 /tmp/zipsrc /tmp/modzip/v1.17.11.zip
+          unzip -Z1 /tmp/modzip/v1.17.11.zip | wc -l
+          ls -l /tmp/modzip/v1.17.11.zip
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: /tmp/modzip/v1.17.11.zip
+          if-no-files-found: error
